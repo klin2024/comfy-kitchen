@@ -3,7 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 
-from .conftest import requires_cuda_backend
+from .conftest import requires_compiled_op
 
 
 def _reference(edges, n):
@@ -22,7 +22,7 @@ def _reference(edges, n):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("connected_components")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(("n", "n_edges"), [(1, 0), (10, 4), (100000, 60000), (100000, 300000)])
 def test_random_graph(n, n_edges, dtype):
@@ -32,7 +32,7 @@ def test_random_graph(n, n_edges, dtype):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("connected_components")
 def test_long_chain():
     # one shuffled path through all nodes: deep trees, many racing hooks
     n = 200000
@@ -44,7 +44,7 @@ def test_long_chain():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("connected_components")
 def test_star_and_isolated():
     n = 50000
     hub = 31337
@@ -58,7 +58,7 @@ def test_star_and_isolated():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_compiled_op("connected_components")
 def test_rejects_bad_input():
     edges = torch.tensor([[0, 1], [1, 2]], device="cuda")
     for n in (None, -1, 2.5):

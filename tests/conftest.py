@@ -62,6 +62,16 @@ requires_cuda_backend = pytest.mark.skipif(
 )
 
 
+def requires_compiled_op(name: str):
+    """Skip unless the compiled CUDA or HIP backend advertises `name`."""
+    backends = ck.list_backends()
+    ok = any(
+        backends.get(b, {}).get("available", False) and name in backends[b].get("capabilities", ())
+        for b in ("cuda", "hip")
+    )
+    return pytest.mark.skipif(not ok, reason=f"compiled CUDA or HIP backend with {name} required")
+
+
 def skip_unless_gfx12_wmma() -> None:
     if not getattr(torch.version, "hip", None):
         pytest.skip("requires HIP")
