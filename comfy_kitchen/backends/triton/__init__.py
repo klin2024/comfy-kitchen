@@ -141,6 +141,7 @@ def _build_constraints() -> dict:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
         return ValidationResult.ok()
 
+    from .w8a16 import HIP_MAX_M as _W8A16_HIP_MAX_M
     from .w8a16 import K_MULTIPLE as _W8A16_K_MULTIPLE
 
     def _linear_w8a16_call_rule(kwargs):
@@ -166,6 +167,10 @@ def _build_constraints() -> dict:
             if not _hip_arch(x.device.index).startswith(_W8A16_HIP_ARCHS):
                 return ValidationResult.fail(
                     "x", f"under ROCm only {'* / '.join(_W8A16_HIP_ARCHS)}* are served"
+                )
+            if x.numel() // k > _W8A16_HIP_MAX_M:
+                return ValidationResult.fail(
+                    "x", f"more than {_W8A16_HIP_MAX_M} rows: left to the cast + hipBLASLt path"
                 )
         return ValidationResult.ok()
 

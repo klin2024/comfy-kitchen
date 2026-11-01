@@ -180,6 +180,29 @@ class TestLinearW8A16Triton:
             tuner.cache.clear()
         assert ran > 0
 
+    def test_rocm_row_limit(self, seed):
+        """Under ROCm calls with more than HIP_MAX_M rows are left to eager (the vendor
+        BLAS GEMM is faster there) and return the reference; under CUDA every row
+        count is served."""
+        _require_triton()
+        from comfy_kitchen.backends.triton import w8a16 as mod
+
+        is_hip = bool(getattr(torch.version, "hip", None))
+        w = (torch.randn(64, 256, device="cuda") * 0.02).to(FP8)
+
+        def served(rows):
+            x = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
+            kwargs = {"x": x, "weight": w, "bias": None}
+            return x, ck.registry.validate_backend_for_call("triton", "linear_w8a16", kwargs).success
+
+        if not served(1)[1]:
+            pytest.skip("triton does not serve linear_w8a16 on this device")
+        assert served(mod.HIP_MAX_M)[1]
+        x, ok = served(mod.HIP_MAX_M + 1)
+        assert ok == (not is_hip)
+        if is_hip:
+            assert torch.equal(ck.linear_w8a16(x, w), _ref(x, w))
+
     def test_dispatch_selects_triton(self, seed):
         _require_triton()
         x, w, b = _inputs(16, 256, 128, torch.bfloat16)
