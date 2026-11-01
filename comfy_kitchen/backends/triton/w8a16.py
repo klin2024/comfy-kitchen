@@ -1,0 +1,220 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Comfy Org. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""W8A16 linear (triton): unscaled FP8 weight read directly, 16-bit activations.
+
+    out[M, N] = x[M, K] @ weight[N, K].to(x.dtype)^T (+ bias), fp32 accumulate
+
+The eager path (and ComfyUI's manual-cast path for unscaled ``*_fp8_e4m3fn``
+checkpoints) writes a bf16/fp16 copy of the whole weight on every call and then
+runs a 16-bit GEMM on it. Here the kernel loads the FP8 bytes (half of the 16-bit
+weight traffic) and converts each tile to the activation dtype in registers,
+right before ``tl.dot``. e4m3 -> bf16 / fp16 is exact, so the dot operands are
+the ones the eager path multiplies; the bias is added to the fp32 accumulator
+before the single rounding to the output dtype (as a GEMM bias epilogue does).
+Results differ from cuBLAS / hipBLASLt only by the fp32 summation order.
+
+One kernel, two shapes of work, chosen per config (constexpr ``GEMV``):
+
+- tiled GEMM: grouped tile order, M and N masked, K stepped by BK (K % BK == 0).
+- GEMV (a few rows): one program per (row, BN outputs); [BN, BK] FP8 tiles are
+  converted to fp32, multiplied by the x chunk and row-summed at the end. Bound
+  by reading the FP8 weight (modulation / time-embedding layers, M = 1, and the
+  short text streams of CFG's unconditional pass).
+
+Plain Triton only (tl.load / tl.dot / tl.sum and dtype casts; no TMA, tensor
+descriptors or inline asm), so the same kernel compiles for NVIDIA and AMD GPUs.
+
+Configs are picked by ``triton.autotune``. Rows <= SMALL_M use one list (GEMV
+configs plus small GEMM tiles), more rows another (GEMM tiles), keyed on N, K
+and the row count (rounded up to a power of two above SMALL_M, so a new text
+length does not trigger a new tuning run). Configs whose BK does not divide K
+are pruned; every list has a BK 32 entry, so K % K_MULTIPLE == 0 always leaves
+at least one.
+"""
+
+import torch
+
+import triton
+import triton.language as tl
+
+K_MULTIPLE = 32
+# Up to this many rows the small-M list (GEMV + small GEMM tiles) is autotuned.
+SMALL_M = 8
+
+
+def _mm(bm, bn, bk, group_m, num_warps, num_stages):
+    return triton.Config(
+        {"GEMV": False, "BM": bm, "BN": bn, "BK": bk, "GROUP_M": group_m},
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
+def _gemv(bn, bk, num_warps, num_stages=3):
+    return triton.Config(
+        {"GEMV": True, "BM": 1, "BN": bn, "BK": bk, "GROUP_M": 1},
+        num_warps=num_warps, num_stages=num_stages,
+    )
+
+
+# GEMM tiles for more than SMALL_M rows. Tuned on NVIDIA RTX 5090 (sm_120) at
+# the Qwen-Image (img M 6889, text M 262 / 46) and Flux.1 dev (img M 4096 /
+# 4352, text M 256) linear shapes.
+_LARGE_M_CONFIGS = [
+    _mm(128, 128, 32, 8, 8, 5),  # large M, K 3072 (q/k/v/out, FFN up, Flux linear1)
+    _mm(128, 128, 128, 4, 8, 3),  # large M, K 12288 (FFN down)
+    _mm(128, 128, 128, 8, 8, 3),  # large M, K 15360 (Flux linear2); text M 256 x N 9216
+    _mm(128, 64, 64, 8, 4, 3),  # K 64 (Qwen-Image img_in)
+    _mm(32, 64, 64, 8, 4, 4),  # N 64 (Qwen-Image proj_out)
+    _mm(32, 64, 128, 8, 4, 3),  # text M ~256 at N 3072
+    _mm(64, 128, 64, 8, 4, 3),  # text M 262, FFN up
+    _mm(64, 64, 64, 8, 4, 3),  # text M 256, FFN up (Flux)
+    _mm(16, 64, 128, 8, 4, 3),  # M 9..64 (Qwen-Image 2512 uncond text M 46)
+]
+
+# Up to SMALL_M rows: GEMV configs (bound by reading the FP8 weight) plus small
+# GEMM tiles. Tuned on NVIDIA RTX 5090 (sm_120).
+_SMALL_M_CONFIGS = [
+    _gemv(8, 512, 8),  # M 1, N 18432 / 6144 (modulation, norm_out)
+    _gemv(8, 512, 4),  # M 1, N 3072 / 9216
+    _gemv(32, 256, 8),  # M 5, 3072 x 3072
+    _gemv(64, 256, 8),  # M 5, K 12288 / 3584
+    _gemv(32, 128, 8),  # M 1, K 256 / 768 (time / vector embedding)
+    _mm(16, 64, 128, 8, 4, 3),  # M 5, FFN up (N 12288)
+    _mm(16, 64, 32, 8, 4, 3),  # any K % 32 == 0
+]
+
+
+@triton.jit
+def _mm_tiles(
+    x_ptr, w_ptr, b_ptr, o_ptr, M, N, K, stride_xm, stride_wn, stride_om,
+    HAS_BIAS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    # Grouped tile order: GROUP_M row tiles sweep the N tiles together for L2 reuse.
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(M, BM)
+    num_n = tl.cdiv(N, BN)
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    gsz = tl.minimum(num_m - first_m, GROUP_M)
+    pm = first_m + (pid % group) % gsz
+    pn = (pid % group) // gsz
+
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    m_mask = rm[:, None] < M
+    n_mask = rn[None, :] < N
+    a_p = x_ptr + rm[:, None].to(tl.int64) * stride_xm + rk[None, :]
+    # [BK, BN] view of the row-major [N, K] FP8 weight
+    b_p = w_ptr + rn[None, :].to(tl.int64) * stride_wn + rk[:, None]
+    dt = o_ptr.dtype.element_ty
+    acc = tl.zeros([BM, BN], tl.float32)
+    for _ in range(0, K, BK):
+        a = tl.load(a_p, mask=m_mask, other=0.0)
+        b = tl.load(b_p, mask=n_mask, other=0.0)
+        acc = tl.dot(a, b.to(dt), acc)  # exact e4m3 -> bf16 / fp16 in registers
+        a_p += BK
+        b_p += BK
+    if HAS_BIAS:
+        acc = acc + tl.load(b_ptr + rn, mask=rn < N, other=0.0).to(tl.float32)[None, :]
+    o_p = o_ptr + rm[:, None].to(tl.int64) * stride_om + rn[None, :]
+    tl.store(o_p, acc.to(dt), mask=m_mask & n_mask)
+
+
+@triton.jit
+def _gemv_rows(
+    x_ptr, w_ptr, b_ptr, o_ptr, N, K, stride_xm, stride_wn, stride_om,
+    HAS_BIAS: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pn = tl.program_id(0)
+    m = tl.program_id(1)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    n_mask = rn < N
+    w_p = w_ptr + rn[:, None].to(tl.int64) * stride_wn + rk[None, :]
+    x_p = x_ptr + m.to(tl.int64) * stride_xm + rk
+    acc = tl.zeros([BN, BK], tl.float32)
+    for _ in range(0, K, BK):
+        w = tl.load(w_p, mask=n_mask[:, None], other=0.0).to(tl.float32)
+        x = tl.load(x_p).to(tl.float32)
+        acc += w * x[None, :]
+        w_p += BK
+        x_p += BK
+    out = tl.sum(acc, axis=1)
+    if HAS_BIAS:
+        out = out + tl.load(b_ptr + rn, mask=n_mask, other=0.0).to(tl.float32)
+    tl.store(o_ptr + m.to(tl.int64) * stride_om + rn, out.to(o_ptr.dtype.element_ty), mask=n_mask)
+
+
+@triton.jit
+def _linear_w8a16_kernel(
+    x_ptr, w_ptr, b_ptr, o_ptr, M, N, K, M_BUCKET,
+    stride_xm, stride_wn, stride_om,
+    HAS_BIAS: tl.constexpr, GEMV: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, GROUP_M: tl.constexpr,
+):
+    # M_BUCKET is only an autotune key (row count rounded up); unused here.
+    if GEMV:
+        _gemv_rows(x_ptr, w_ptr, b_ptr, o_ptr, N, K, stride_xm, stride_wn, stride_om,
+                   HAS_BIAS, BN, BK)
+    else:
+        _mm_tiles(x_ptr, w_ptr, b_ptr, o_ptr, M, N, K, stride_xm, stride_wn, stride_om,
+                  HAS_BIAS, BM, BN, BK, GROUP_M)
+
+
+def _prune_bk(configs, named_args, **kwargs):
+    k = named_args["K"]
+    return [c for c in configs if k % c.kwargs["BK"] == 0]
+
+
+def _autotuned(configs, key):
+    return triton.autotune(
+        configs=configs, key=key, prune_configs_by={"early_config_prune": _prune_bk}
+    )(_linear_w8a16_kernel)
+
+
+_small_m_kernel = _autotuned(_SMALL_M_CONFIGS, ["M", "N", "K"])
+_large_m_kernel = _autotuned(_LARGE_M_CONFIGS, ["M_BUCKET", "N", "K"])
+
+
+def _grid(m, n):
+    def grid(meta):
+        if meta["GEMV"]:
+            return (triton.cdiv(n, meta["BN"]), m)
+        return (triton.cdiv(m, meta["BM"]) * triton.cdiv(n, meta["BN"]), 1)
+
+    return grid
+
+
+def linear_w8a16(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``linear(x, weight.to(x.dtype), bias.to(x.dtype))`` reading the FP8 weight directly."""
+    k = x.shape[-1]
+    n = weight.shape[0]
+    x2 = x.reshape(-1, k)
+    if x2.stride(-1) != 1:
+        x2 = x2.contiguous()
+    m = x2.shape[0]
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    if m == 0 or n == 0:
+        return out.view(*x.shape[:-1], n)
+    if bias is not None:
+        # The reference rounds the bias to x's dtype first; FP8 -> x.dtype is exact
+        # and done in the kernel, anything else is rounded here (N elements).
+        if bias.dtype not in (x.dtype, torch.float8_e4m3fn):
+            bias = bias.to(x.dtype)
+        bias = bias.contiguous()
+    if m <= SMALL_M:
+        kernel, m_bucket = _small_m_kernel, m
+    else:
+        kernel, m_bucket = _large_m_kernel, triton.next_power_of_2(m)
+    kernel[_grid(m, n)](
+        x2, weight, weight if bias is None else bias, out, m, n, k, m_bucket,
+        x2.stride(0), weight.stride(0), out.stride(0),
+        HAS_BIAS=bias is not None,
+    )
+    return out.view(*x.shape[:-1], n)
