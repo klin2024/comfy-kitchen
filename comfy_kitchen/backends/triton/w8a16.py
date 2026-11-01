@@ -209,9 +209,43 @@ def _prune(configs, named_args, **kwargs):
     return fit or [min(tiled, key=_smem_bytes)]
 
 
+_HIP = bool(getattr(torch.version, "hip", None))
+_FLUSH_BYTES = 256 * 2**20
+
+
+def _bench_read_flush(kernel_call, quantiles, reps=25):
+    """Autotune timing used under ROCm (ms at the given quantiles).
+
+    Triton's default do_bench evicts the caches by zero-filling a 256 MB buffer
+    before every launch. On gfx1151 (an APU with a 32 MB last-level cache) the timed
+    kernel then runs behind the write-back of those dirty lines: times come out 2-3x
+    high and in a different order than in steady state, and the autotuner picked
+    configs 10-38% slower than the fastest at the text (M 256 / 262) shapes. Reading
+    the buffer instead evicts the caches without leaving dirty lines; that ranking
+    matched the one measured with rotating weight copies (the model's access
+    pattern) at every shape checked.
+    """
+    flush = torch.ones(_FLUSH_BYTES // 4, dtype=torch.int32, device="cuda")
+    kernel_call()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(reps):
+        flush.sum()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        kernel_call()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end))
+    t = torch.tensor(times)
+    return [torch.quantile(t, q).item() for q in quantiles]
+
+
 def _autotuned(configs, key):
     return triton.autotune(
-        configs=configs, key=key, prune_configs_by={"early_config_prune": _prune}
+        configs=configs, key=key, prune_configs_by={"early_config_prune": _prune},
+        do_bench=_bench_read_flush if _HIP else None,
     )(_linear_w8a16_kernel)
 
 

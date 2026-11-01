@@ -191,6 +191,21 @@ class TestLinearW8A16Triton:
             assert all(mod._smem_bytes(c) <= limit and 256 % c.kwargs["BK"] == 0 for c in kept)
         assert mod._prune([huge], {"K": 256, "x_ptr": x}) == [huge]  # last resort, never empty
 
+    def test_read_flush_bench(self, seed):
+        """The ROCm autotune timer returns one time (ms) per requested quantile, in order,
+        and is the timer both tuners use under ROCm."""
+        _require_triton()
+        from comfy_kitchen.backends.triton import w8a16 as mod
+
+        x, w, b = _inputs(64, 512, 256, torch.bfloat16)
+        q50, q20, q80 = mod._bench_read_flush(
+            lambda: mod.linear_w8a16(x, w, b), quantiles=(0.5, 0.2, 0.8), reps=5
+        )
+        assert 0 < q20 <= q50 <= q80
+        if getattr(torch.version, "hip", None):
+            for tuner in (mod._small_m_kernel, mod._large_m_kernel):
+                assert tuner.do_bench is mod._bench_read_flush
+
     def test_rocm_gate(self, seed):
         """Under ROCm the kernel is served only on gfx1151 (exact arch, feature suffixes
         stripped) and only up to HIP_MAX_ROWS["gfx1151"] rows; every other ROCm arch and
