@@ -68,11 +68,11 @@ corresponding operator is available.
 activations) serves weights with contiguous rows and `in_features % 32 == 0`,
 and an optional 1D bias of any float or FP8 dtype, on NVIDIA GPUs with compute
 capability 8.9+ and, under ROCm, only on gfx1151 (the one AMD arch measured so far)
-for inputs of at most 384 rows (with more rows the cast plus hipBLASLt's bf16 GEMM
-is faster there); other AMD archs run the reference until measured. It reads the
-FP8 weight directly; results equal the eager reference
-`F.linear(x, weight.to(x.dtype), bias.to(x.dtype))` up to the fp32 summation
-order. Other calls run that reference.
+for inputs of at most 384 rows and weights of at least 2M elements (outside that
+the cast plus hipBLASLt's bf16 GEMM is faster there); other AMD archs run the
+reference until measured. It reads the FP8 weight directly; results equal the
+eager reference `F.linear(x, weight.to(x.dtype), bias.to(x.dtype))` up to the
+fp32 summation order. Other calls run that reference.
 
 ## Huawei Ascend backend
 

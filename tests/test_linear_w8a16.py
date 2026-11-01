@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+
 import pytest
 import torch
 from torch.nn import functional
@@ -55,13 +57,32 @@ def _require_triton():
         pytest.skip("triton backend not capable for linear_w8a16")
 
 
+@contextlib.contextmanager
+def _rocm_gate_lifted():
+    """Lift the ROCm performance gate (row limit, minimum weight size) of the served
+    archs, so the kernel's correctness is checked at any size; the gate itself has its
+    own test. Archs that are not served stay refused."""
+    from comfy_kitchen.backends.triton import w8a16 as mod
+
+    rows, weight = dict(mod.HIP_MAX_ROWS), dict(mod.HIP_MIN_WEIGHT)
+    mod.HIP_MAX_ROWS.update({a: 1 << 62 for a in rows})
+    mod.HIP_MIN_WEIGHT.update({a: 0 for a in weight})
+    try:
+        yield
+    finally:
+        mod.HIP_MAX_ROWS.update(rows)
+        mod.HIP_MIN_WEIGHT.update(weight)
+
+
 def _triton(x, w, b=None):
     kwargs = {"x": x, "weight": w, "bias": b}
-    valid = ck.registry.validate_backend_for_call("triton", "linear_w8a16", kwargs)
-    if not valid.success:
-        pytest.skip(f"triton refuses this call here: {valid.failed_param}: {valid.failure_reason}")
-    with ck.use_backend("triton"):
-        return ck.linear_w8a16(x, w, b)
+    with _rocm_gate_lifted():
+        valid = ck.registry.validate_backend_for_call("triton", "linear_w8a16", kwargs)
+        if not valid.success:
+            why = f"{valid.failed_param}: {valid.failure_reason}"
+            pytest.skip(f"triton refuses this call here: {why}")
+        with ck.use_backend("triton"):
+            return ck.linear_w8a16(x, w, b)
 
 
 def _check(out, x, w, b):
@@ -208,9 +229,10 @@ class TestLinearW8A16Triton:
 
     def test_rocm_gate(self, seed):
         """Under ROCm the kernel is served only on gfx1151 (exact arch, feature suffixes
-        stripped) and only up to HIP_MAX_ROWS["gfx1151"] rows; every other ROCm arch and
-        more rows fall back to eager. The arch is mocked, so this runs on any GPU; on a
-        real ROCm device a refused call returns the eager reference."""
+        stripped), only up to HIP_MAX_ROWS["gfx1151"] rows and only for weights of at
+        least HIP_MIN_WEIGHT["gfx1151"] elements; every other ROCm arch, more rows and
+        smaller weights fall back to eager. The arch is mocked, so this runs on any GPU;
+        on a real ROCm device a refused call returns the eager reference."""
         _require_triton()
         import comfy_kitchen.backends.triton as triton_backend
         from comfy_kitchen.backends.triton import w8a16 as mod
@@ -218,35 +240,39 @@ class TestLinearW8A16Triton:
         assert triton_backend._arch_name("gfx1151") == "gfx1151"
         assert triton_backend._arch_name("gfx942:sramecc+:xnack-") == "gfx942"
         limit = mod.HIP_MAX_ROWS["gfx1151"]
-        w = (torch.randn(64, 256, device="cuda") * 0.02).to(FP8)
+        min_weight = mod.HIP_MIN_WEIGHT["gfx1151"]
+        big = (torch.randn(min_weight // 1024, 1024, device="cuda") * 0.02).to(FP8)
+        small = big[: min_weight // 1024 - 1]
 
-        def served(rows):
-            x = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
+        def served(rows, w):
+            x = torch.randn(rows, 1024, device="cuda", dtype=torch.bfloat16)
             kwargs = {"x": x, "weight": w, "bias": None}
             valid = ck.registry.validate_backend_for_call("triton", "linear_w8a16", kwargs)
             return x, valid.success
 
         real_hip = getattr(torch.version, "hip", None)
         saved_arch = triton_backend._hip_arch
-        cases = [("gfx1151", 1, True), ("gfx1151", limit, True), ("gfx1151", limit + 1, False)]
+        cases = [("gfx1151", 1, big, True), ("gfx1151", limit, big, True),
+                 ("gfx1151", limit + 1, big, False), ("gfx1151", 1, small, False)]
         others = ("gfx1201", "gfx1200", "gfx1150", "gfx1100", "gfx942", "gfx950")
-        cases += [(a, 1, False) for a in others]
+        cases += [(a, 1, big, False) for a in others]
         try:
             torch.version.hip = real_hip or "mocked"
-            for arch, rows, ok in cases:
+            for arch, rows, w, ok in cases:
                 triton_backend._hip_arch = lambda index, arch=arch: arch
-                assert served(rows)[1] == ok, (arch, rows)
+                assert served(rows, w)[1] == ok, (arch, rows, w.shape)
         finally:
             triton_backend._hip_arch = saved_arch
             torch.version.hip = real_hip
         if real_hip:
-            x, ok = served(limit + 1)
-            assert not ok
-            assert torch.equal(ck.linear_w8a16(x, w), _ref(x, w))
+            for rows, w in ((limit + 1, big), (1, small)):
+                x, ok = served(rows, w)
+                assert not ok
+                assert torch.equal(ck.linear_w8a16(x, w), _ref(x, w))
 
     def test_dispatch_selects_triton(self, seed):
         _require_triton()
-        x, w, b = _inputs(16, 256, 128, torch.bfloat16)
+        x, w, b = _inputs(16, 1024, 2048, torch.bfloat16)
         kwargs = {"x": x, "weight": w, "bias": b}
         assert ck.registry.get_capable_backend("linear_w8a16", kwargs) == "triton"
 

@@ -52,6 +52,11 @@ SMALL_M = 8
 # 3072 -> 12288 0.64x / 0.79x, 12288 -> 3072 0.46x / 0.62x; so 384 rows, below
 # the first measured loss.
 HIP_MAX_ROWS = {"gfx1151": 384}
+# Fewer weight elements than this stay on eager too: for a weight that small (the
+# gfx1151 measurement: 256 -> 3072, 0.8 MB of FP8) the saved weight read is worth
+# less than the triton launch path costs on the CPU, and a back-to-back call was
+# 1.41x slower than the cast path (768 -> 3072, 2.4 MB: 0.82x, faster).
+HIP_MIN_WEIGHT = {"gfx1151": 1 << 21}
 
 
 def _mm(bm, bn, bk, group_m, num_warps, num_stages):

@@ -143,6 +143,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     from .w8a16 import HIP_MAX_ROWS as _W8A16_HIP_MAX_ROWS
+    from .w8a16 import HIP_MIN_WEIGHT as _W8A16_HIP_MIN_WEIGHT
     from .w8a16 import K_MULTIPLE as _W8A16_K_MULTIPLE
 
     def _linear_w8a16_call_rule(kwargs):
@@ -176,6 +177,11 @@ def _build_constraints() -> dict:
             if x.numel() // k > max_rows:
                 return ValidationResult.fail(
                     "x", f"more than {max_rows} rows on {arch}: the cast + hipBLASLt path is faster"
+                )
+            min_weight = _W8A16_HIP_MIN_WEIGHT.get(arch, 0)
+            if weight.numel() < min_weight:
+                return ValidationResult.fail(
+                    "weight", f"fewer than {min_weight} elements on {arch}: eager is faster"
                 )
         return ValidationResult.ok()
 
