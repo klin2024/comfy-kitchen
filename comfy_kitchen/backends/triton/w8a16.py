@@ -69,6 +69,11 @@ _LARGE_M_CONFIGS = [
     _mm(64, 128, 64, 8, 4, 3),  # text M 262, FFN up
     _mm(64, 64, 64, 8, 4, 3),  # text M 256, FFN up (Flux)
     _mm(16, 64, 128, 8, 4, 3),  # M 9..64 (Qwen-Image 2512 uncond text M 46)
+    # Tuned on AMD Radeon 8060S (gfx1151, 64 KB LDS: the 5090's 3+ stage BK 128 and
+    # BK 32 x 5 stage tiles do not fit) at the text M 256 / 262 shapes.
+    _mm(64, 128, 64, 8, 4, 2),  # N 3072 / 12288 at K 3072, K 3584
+    _mm(128, 64, 64, 8, 4, 2),  # N 9216 / 12288 (Flux)
+    _mm(128, 128, 64, 8, 8, 2),  # K 12288 / 4096
 ]
 
 # Up to SMALL_M rows: GEMV configs (bound by reading the FP8 weight) plus small
@@ -81,6 +86,8 @@ _SMALL_M_CONFIGS = [
     _gemv(32, 128, 8),  # M 1, K 256 / 768 (time / vector embedding)
     _mm(16, 64, 128, 8, 4, 3),  # M 5, FFN up (N 12288)
     _mm(16, 64, 32, 8, 4, 3),  # any K % 32 == 0
+    # Tuned on AMD Radeon 8060S (gfx1151): uncond text M 5, FFN up / down.
+    _mm(16, 64, 256, 8, 4, 2),
 ]
 
 
