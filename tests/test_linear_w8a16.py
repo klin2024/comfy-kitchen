@@ -153,33 +153,43 @@ class TestLinearW8A16Triton:
 
     @pytest.mark.parametrize("path", ["small_m", "large_m"])
     def test_every_config_covers_output(self, path, seed):
-        """Each autotune config on its own writes every output element correctly at a
-        shape no tile divides (M and N masked). Configs that do not fit this GPU's
-        shared memory are skipped, as the autotuner skips them."""
+        """Each autotune config that fits this device (the configs the autotuner keeps
+        after pruning) writes every output element correctly on its own, at a shape no
+        tile divides (M and N masked)."""
         _require_triton()
-        from triton.runtime.errors import OutOfResources
-
         from comfy_kitchen.backends.triton import w8a16 as mod
 
         tuner = mod._small_m_kernel if path == "small_m" else mod._large_m_kernel
         m = 5 if path == "small_m" else 77
         x, w, b = _inputs(m, 512, 200, torch.bfloat16, "fp8")
         configs = list(tuner.configs)
-        ran = 0
+        valid = mod._prune(configs, {"K": 512, "x_ptr": x})
+        assert valid
         try:
-            for cfg in configs:
+            for cfg in valid:
                 tuner.configs = [cfg]
                 tuner.cache.clear()
-                try:
-                    out = _triton(x, w, b)
-                except OutOfResources:
-                    continue
-                ran += 1
+                out = _triton(x, w, b)
                 assert _rel(out, _ref(x, w, b)) <= 2e-2, str(cfg)
         finally:
             tuner.configs = configs
             tuner.cache.clear()
-        assert ran > 0
+
+    def test_prune_shared_memory(self):
+        """Pruning keeps only configs whose pipelined tiles fit the device's shared
+        memory, never returns an empty list, and drops the K-untiled ones."""
+        _require_triton()
+        from comfy_kitchen.backends.triton import w8a16 as mod
+
+        x = torch.zeros(4, 256, device="cuda", dtype=torch.bfloat16)
+        limit = mod._max_shared_mem(x.device.index)
+        huge = mod._mm(256, 256, 256, 8, 8, 4)  # 3 x 192 KB
+        for configs in (mod._SMALL_M_CONFIGS, mod._LARGE_M_CONFIGS):
+            kept = mod._prune(list(configs) + [huge], {"K": 256, "x_ptr": x})
+            assert kept
+            assert huge not in kept
+            assert all(mod._smem_bytes(c) <= limit and 256 % c.kwargs["BK"] == 0 for c in kept)
+        assert mod._prune([huge], {"K": 256, "x_ptr": x}) == [huge]  # last resort, never empty
 
     def test_rocm_gate(self, seed):
         """Under ROCm the kernel is served only on gfx1151 (exact arch, feature suffixes

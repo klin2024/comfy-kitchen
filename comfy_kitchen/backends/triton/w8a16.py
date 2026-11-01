@@ -27,10 +27,13 @@ descriptors or inline asm), so the same kernel compiles for NVIDIA and AMD GPUs.
 Configs are picked by ``triton.autotune``. Rows <= SMALL_M use one list (GEMV
 configs plus small GEMM tiles), more rows another (GEMM tiles), keyed on N, K
 and the row count (rounded up to a power of two above SMALL_M, so a new text
-length does not trigger a new tuning run). Configs whose BK does not divide K
-are pruned; every list has a BK 32 entry, so K % K_MULTIPLE == 0 always leaves
-at least one.
+length does not trigger a new tuning run). Configs whose BK does not divide K,
+or whose pipelined tiles do not fit the device's shared memory (64 KB of LDS on
+gfx1151 vs ~99 KB on an RTX 5090), are pruned before tuning; every list has
+a small BK 32 entry, so K % K_MULTIPLE == 0 always leaves at least one.
 """
+
+import functools
 
 import torch
 
@@ -179,14 +182,36 @@ def _linear_w8a16_kernel(
                   HAS_BIAS, BM, BN, BK, GROUP_M)
 
 
-def _prune_bk(configs, named_args, **kwargs):
+@functools.lru_cache(maxsize=None)
+def _max_shared_mem(device_index: int) -> int:
+    props = triton.runtime.driver.active.utils.get_device_properties(device_index)
+    return props["max_shared_mem"]
+
+
+def _smem_bytes(config) -> int:
+    """Shared memory of a config's pipelined K loop: num_stages - 1 buffered copies of
+    the 16-bit x tile and the FP8 weight tile. (That is what Triton reports for the
+    configs that do not fit: BM 128 x BN 128 x BK 128 at 3 stages needs 98304 B.)"""
+    kw = config.kwargs
+    if kw["GEMV"]:
+        per_stage = kw["BN"] * kw["BK"] + 2 * kw["BK"]
+    else:
+        per_stage = 2 * kw["BM"] * kw["BK"] + kw["BK"] * kw["BN"]
+    return max(config.num_stages - 1, 1) * per_stage
+
+
+def _prune(configs, named_args, **kwargs):
+    """Configs that tile K evenly and fit the device's shared memory (LDS)."""
     k = named_args["K"]
-    return [c for c in configs if k % c.kwargs["BK"] == 0]
+    tiled = [c for c in configs if k % c.kwargs["BK"] == 0]
+    limit = _max_shared_mem(named_args["x_ptr"].device.index)
+    fit = [c for c in tiled if _smem_bytes(c) <= limit]
+    return fit or [min(tiled, key=_smem_bytes)]
 
 
 def _autotuned(configs, key):
     return triton.autotune(
-        configs=configs, key=key, prune_configs_by={"early_config_prune": _prune_bk}
+        configs=configs, key=key, prune_configs_by={"early_config_prune": _prune}
     )(_linear_w8a16_kernel)
 
 
