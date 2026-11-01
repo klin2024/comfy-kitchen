@@ -40,13 +40,15 @@ import triton.language as tl
 K_MULTIPLE = 32
 # Up to this many rows the small-M list (GEMV + small GEMM tiles) is autotuned.
 SMALL_M = 8
-# Under ROCm, calls with more rows are left to eager (cast + hipBLASLt). On an AMD
-# Radeon 8060S (gfx1151) this kernel beats the cast path by reading half the weight
-# bytes while the GEMM is small, but hipBLASLt's bf16 GEMM is faster once the
-# weight read is amortized: summed over the 3072 -> 3072 / 12288 and 12288 -> 3072
-# DiT linears the kernel takes 0.36x of the cast path's time at 64 rows, 0.86x at
-# 768, 0.98x at 1024 and 1.04x at 1536.
-HIP_MAX_M = 768
+# ROCm: the archs this kernel is served on (exact gcnArchName, feature suffixes
+# stripped) and, per arch, the most rows it is served for. Every other ROCm arch,
+# and more rows, stay on eager (cast + hipBLASLt). Measured on an AMD Radeon 8060S
+# (gfx1151): the kernel wins while the GEMM is small (it reads half the weight
+# bytes), hipBLASLt's bf16 GEMM once the weight read is amortized. Per shape, the
+# kernel's time vs the cast path at 384 / 512 rows: 3072 -> 3072 0.79x / 1.02x,
+# 3072 -> 12288 0.64x / 0.79x, 12288 -> 3072 0.46x / 0.62x; so 384 rows, below
+# the first measured loss.
+HIP_MAX_ROWS = {"gfx1151": 384}
 
 
 def _mm(bm, bn, bk, group_m, num_warps, num_stages):

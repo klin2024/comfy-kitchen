@@ -37,7 +37,8 @@ def _bias(kind, n, device):
     if kind == "none":
         return None
     b = torch.randn(n, device=device) * 0.02
-    return b.to({"fp8": FP8, "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[kind])
+    dtypes = {"fp8": FP8, "bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    return b.to(dtypes[kind])
 
 
 def _inputs(m, k, n, dtype, bias="fp8", device="cuda"):
@@ -180,27 +181,42 @@ class TestLinearW8A16Triton:
             tuner.cache.clear()
         assert ran > 0
 
-    def test_rocm_row_limit(self, seed):
-        """Under ROCm calls with more than HIP_MAX_M rows are left to eager (the vendor
-        BLAS GEMM is faster there) and return the reference; under CUDA every row
-        count is served."""
+    def test_rocm_gate(self, seed):
+        """Under ROCm the kernel is served only on gfx1151 (exact arch, feature suffixes
+        stripped) and only up to HIP_MAX_ROWS["gfx1151"] rows; every other ROCm arch and
+        more rows fall back to eager. The arch is mocked, so this runs on any GPU; on a
+        real ROCm device a refused call returns the eager reference."""
         _require_triton()
+        import comfy_kitchen.backends.triton as triton_backend
         from comfy_kitchen.backends.triton import w8a16 as mod
 
-        is_hip = bool(getattr(torch.version, "hip", None))
+        assert triton_backend._arch_name("gfx1151") == "gfx1151"
+        assert triton_backend._arch_name("gfx942:sramecc+:xnack-") == "gfx942"
+        limit = mod.HIP_MAX_ROWS["gfx1151"]
         w = (torch.randn(64, 256, device="cuda") * 0.02).to(FP8)
 
         def served(rows):
             x = torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16)
             kwargs = {"x": x, "weight": w, "bias": None}
-            return x, ck.registry.validate_backend_for_call("triton", "linear_w8a16", kwargs).success
+            valid = ck.registry.validate_backend_for_call("triton", "linear_w8a16", kwargs)
+            return x, valid.success
 
-        if not served(1)[1]:
-            pytest.skip("triton does not serve linear_w8a16 on this device")
-        assert served(mod.HIP_MAX_M)[1]
-        x, ok = served(mod.HIP_MAX_M + 1)
-        assert ok == (not is_hip)
-        if is_hip:
+        real_hip = getattr(torch.version, "hip", None)
+        saved_arch = triton_backend._hip_arch
+        cases = [("gfx1151", 1, True), ("gfx1151", limit, True), ("gfx1151", limit + 1, False)]
+        others = ("gfx1201", "gfx1200", "gfx1150", "gfx1100", "gfx942", "gfx950")
+        cases += [(a, 1, False) for a in others]
+        try:
+            torch.version.hip = real_hip or "mocked"
+            for arch, rows, ok in cases:
+                triton_backend._hip_arch = lambda index, arch=arch: arch
+                assert served(rows)[1] == ok, (arch, rows)
+        finally:
+            triton_backend._hip_arch = saved_arch
+            torch.version.hip = real_hip
+        if real_hip:
+            x, ok = served(limit + 1)
+            assert not ok
             assert torch.equal(ck.linear_w8a16(x, w), _ref(x, w))
 
     def test_dispatch_selects_triton(self, seed):

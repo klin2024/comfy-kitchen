@@ -121,14 +121,15 @@ if _TRITON_AVAILABLE:
         return _triton_quantize_and_rotate_rowwise(x, h, group_size)
 
 
+def _arch_name(gcn_arch_name: str) -> str:
+    """Bare ROCm arch, e.g. 'gfx942:sramecc+:xnack-' -> 'gfx942'."""
+    return gcn_arch_name.split(":")[0]
+
+
 @functools.lru_cache(maxsize=None)
 def _hip_arch(device_index: int | None) -> str:
     index = torch.cuda.current_device() if device_index is None else device_index
-    return torch.cuda.get_device_properties(index).gcnArchName
-
-
-# ROCm archs linear_w8a16 was validated on (RDNA 3.5: gfx1150 / gfx1151).
-_W8A16_HIP_ARCHS = ("gfx115",)
+    return _arch_name(torch.cuda.get_device_properties(index).gcnArchName)
 
 
 def _build_constraints() -> dict:
@@ -141,7 +142,7 @@ def _build_constraints() -> dict:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
         return ValidationResult.ok()
 
-    from .w8a16 import HIP_MAX_M as _W8A16_HIP_MAX_M
+    from .w8a16 import HIP_MAX_ROWS as _W8A16_HIP_MAX_ROWS
     from .w8a16 import K_MULTIPLE as _W8A16_K_MULTIPLE
 
     def _linear_w8a16_call_rule(kwargs):
@@ -164,13 +165,17 @@ def _build_constraints() -> dict:
                 "bias", "must be on x's device with weight.shape[0] elements"
             )
         if getattr(torch.version, "hip", None):
-            if not _hip_arch(x.device.index).startswith(_W8A16_HIP_ARCHS):
+            # Only measured ROCm archs, and only in their measured winning regime;
+            # everything else keeps the cast + hipBLASLt path (eager).
+            arch = _hip_arch(x.device.index)
+            max_rows = _W8A16_HIP_MAX_ROWS.get(arch)
+            if max_rows is None:
                 return ValidationResult.fail(
-                    "x", f"under ROCm only {'* / '.join(_W8A16_HIP_ARCHS)}* are served"
+                    "x", f"ROCm arch {arch} not measured (served: {sorted(_W8A16_HIP_MAX_ROWS)})"
                 )
-            if x.numel() // k > _W8A16_HIP_MAX_M:
+            if x.numel() // k > max_rows:
                 return ValidationResult.fail(
-                    "x", f"more than {_W8A16_HIP_MAX_M} rows: left to the cast + hipBLASLt path"
+                    "x", f"more than {max_rows} rows on {arch}: the cast + hipBLASLt path is faster"
                 )
         return ValidationResult.ok()
 
